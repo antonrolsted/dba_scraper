@@ -19,9 +19,16 @@ def parse_listing(html, url):
     title_el = soup.select_one('h1[data-testid="object-title"]') or soup.select_one('h1[class="break-words mb-24"]')
 
     raw = title_el.decode_contents() if title_el else ""
-    print("codepoints:", [hex(ord(c)) for c in raw[:40]])
     title = title_el.string
-    print(f"TITLE MF: {title}")
+
+    # annonce-id
+
+    #annonce_id_el = soup.select_one('section[data-testid="object-info"]')
+    #if annonce_id_el:
+        
+    #annonce_id_el_p = annonce_id_el.select_one('p').string
+    #print(annonce_id_el_p)
+    
 
     # Price: prefer <p class="h2"> (your screenshot) else fallback to regex search for "kr"
     price_el = soup.select_one('p.h2') or soup.find(text=re.compile(r'\d{2,}\s*(?:kr|kr\.|,-)', re.IGNORECASE))
@@ -48,28 +55,72 @@ def parse_listing(html, url):
 
     price_num = extract_int(price_text)
 
-    # Condition: "Mere information" section contains <b>Brugt - men i god stand</b> in your screenshot
-    condition_text = "Not specified"
-    info_section = soup.find('section', attrs={'aria-label': 'Mere information'}) or soup.find('section', attrs={'aria-label': re.compile(r'Mere', re.I)})
+    # Condition: Initialize variable and handle the parsing more safely
+    condition_text_el = None
+    info_section = soup.select_one('span[class="flex gap-8 border rounded-full py-8 px-16"]')
+    
     if info_section:
-        b = info_section.find('b')
-        if b:
-            condition_text = b.get_text(strip=True)
-        else:
-            p = info_section.find('p')
-            if p:
-                condition_text = p.get_text(" ", strip=True)
+        condition_text_el = info_section.select_one("b")
+        condition_text = condition_text_el.string if condition_text_el else "Not specified"
+    else:
+        condition_text = "Not specified"
+
+
 
     # Description: use data-testid description if present
-    desc_el = soup.select_one('section[data-testid="description"]') or soup.select_one('section.about-section') or soup.select_one('meta[name="description"]')
+    desc_el = soup.select_one('div.whitespace-pre-wrap') or soup.select_one('section[data-testid="description"]')
     if desc_el:
-        desc = desc_el.get_text(" ", strip=True) if hasattr(desc_el, 'get_text') else desc_el.get('content', '')
+        p_tags = desc_el.find_all('p')
+        
+        if p_tags:
+            # Use direct string property instead of get_text()
+            paragraphs = []
+            for p in p_tags:
+                # Use .string or decode_contents() instead of get_text()
+                text = p.string or p.decode_contents()
+                if text:
+                    # Clean up any HTML entities and strip whitespace
+                    text = text.strip()
+                    if text:
+                        paragraphs.append(text)
+            
+            desc = '\n'.join(paragraphs)
+        else:
+            desc = desc_el.decode_contents().strip()
     else:
-        desc = ""
+        desc = "Ingen desc (auto)"
+
+    # Date
+
 
     # Location: map-link or fallback selectors
-    loc_el = soup.select_one('a[data-testid="map-link"]') or soup.select_one('.location') or soup.select_one('div.vip-location')
-    location = loc_el.get_text(" ", strip=True) if loc_el else ""
+    loc_el = soup.select_one('span[data-testid="object-address"]')
+    location = loc_el.string
+
+    # Get annonce-id and date from object-info section
+    annonce_id = None
+    date = ""
+    info_section = soup.select_one('section[data-testid="object-info"]')
+    if info_section:
+        # Get all p tags in the section
+        info_texts = [p.get_text(strip=True) for p in info_section.find_all('p')]
+        
+        # Find ID (usually last line with just numbers)
+        for text in info_texts:
+            if text.isdigit():
+                annonce_id = text
+                break
+        
+        # Find date (line starting with "Sidst redigeret")
+        for text in info_texts:
+            if "redigeret" in text:
+                date = text.replace("Sidst redigeret", "").strip()
+                break
+
+    # Fallback for ID if not found
+    if not annonce_id:
+        url_match = re.search(r'/item/(\d+)', url)
+        annonce_id = url_match.group(1) if url_match else "unknown"
 
     # Small debug output to help you confirm parsing; remove later
     print("URL:", url)
@@ -80,12 +131,13 @@ def parse_listing(html, url):
     print("-" * 40)
 
     return {
+        "post_id": annonce_id,
         "url": url,
         "title": title,
         "price_dkk": price_num,
         "desc": desc,
         "location": location,
-        "date": "",
+        "date": date,
         "condition_text": condition_text
     }
 
@@ -96,13 +148,16 @@ if __name__ == "__main__":
         "https://www.dba.dk/recommerce/forsale/item/14769358"
     ]
     out = Path("data/raw_auto.csv")
-    # create data directory if missing
     out.parent.mkdir(parents=True, exist_ok=True)
 
-    print("CSV path:", out.resolve())
-
     with out.open("w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=["url", "title", "price_dkk", "desc", "location", "date", "condition_text"])
+        # Use quoting=csv.QUOTE_ALL to properly escape fields containing commas
+        w = csv.DictWriter(f, 
+            fieldnames=["post_id", "url", "title", "price_dkk", "desc", "location", "date", "condition_text"],
+            quoting=csv.QUOTE_ALL,  # Quote all fields
+            quotechar='"',          # Use double quotes
+            escapechar='\\'         # Use backslash to escape quotes within fields
+        )
         w.writeheader()
         for u in urls:
             try:
@@ -124,7 +179,6 @@ if __name__ == "__main__":
                         os.fsync(f.fileno())
                     except Exception:
                         pass
-                    print(f"WROTE row for {u} (price {item.get('price_dkk')})")
                 else:
                     # Debug: also write a row with empty price so you can inspect failures
                     debug_item = {**item, "price_dkk": ""}
