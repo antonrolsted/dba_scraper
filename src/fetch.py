@@ -6,9 +6,10 @@ import requests
 from bs4 import BeautifulSoup
 import re
 import os
+from urllib.parse import urljoin, urlparse, parse_qsl, urlencode, urlunparse
 
 def delayed_fetch(url):
-    time.sleep(2 + random.random()*2) # 2-4 sec delay
+    time.sleep(0.5 + random.random()*0.5) # 2-4 sec delay
     h = {"User-Agent":"Mozilla/5.0"}
     return requests.get(url, headers=h, timeout=15)
 
@@ -141,53 +142,113 @@ def parse_listing(html, url):
         "condition_text": condition_text
     }
 
+def collect_listing_urls(search_url, max_pages=10, pause=0.4):
+    """
+    Build pages by setting the `page` query param (page=1..max_pages)
+    and extract listing links from each page. Returns deduplicated full URLs.
+    """
+    seen = set()
+    results = []
+
+    parsed = urlparse(search_url)
+    def extract_from_html(base_url, html):
+        soup = BeautifulSoup(html, "html.parser")
+        found = 0
+        for a in soup.find_all("a", href=True):
+            href = a["href"]
+            if re.search(r'/item/\d+', href):
+                full = urljoin(base_url, href)
+                if full not in seen:
+                    seen.add(full)
+                    results.append(full)
+                    found += 1
+        return found
+
+    for page in range(1, max_pages + 1):
+        qs = dict(parse_qsl(parsed.query, keep_blank_values=True))
+        qs['page'] = str(page)
+        new_q = urlencode(qs, doseq=True)
+        page_url = urlunparse(parsed._replace(query=new_q))
+
+        print(f"Collecting page {page}: {page_url}")
+        try:
+            r = delayed_fetch(page_url)
+        except Exception as e:
+            print("Fetch failed:", e)
+            break
+        if not r.ok:
+            print("HTTP error", r.status_code, "for", page_url)
+            break
+
+        found = extract_from_html(page_url, r.text)
+        if found == 0:
+            print("No listings found on page", page, "- stopping early.")
+            break
+
+        time.sleep(pause)
+
+    return results
+
 if __name__ == "__main__":
-    urls = [
-        "https://www.dba.dk/recommerce/forsale/item/9416406",
-        "https://www.dba.dk/recommerce/forsale/item/3458498",
-        "https://www.dba.dk/recommerce/forsale/item/14769358"
-    ]
-    out = Path("data/raw_auto.csv")
+    search_url = "https://www.dba.dk/recommerce/forsale/search?page=1&product_category=2.93.3216.506"  # change to your search URL
+    max_pages = 10          # how many result pages to crawl
+    out = Path(__file__).resolve().parent.parent / "data" / "raw_auto.csv"
     out.parent.mkdir(parents=True, exist_ok=True)
 
-    with out.open("w", newline="", encoding="utf-8") as f:
-        # Use quoting=csv.QUOTE_ALL to properly escape fields containing commas
-        w = csv.DictWriter(f, 
+    urls_file = out.parent / "listing_urls.txt"
+
+    # 1) collect or load listing URLs
+    if urls_file.exists():
+        listing_urls = [line.strip() for line in urls_file.read_text(encoding="utf-8").splitlines() if line.strip()]
+        print(f"Loaded {len(listing_urls)} URLs from {urls_file}")
+    else:
+        listing_urls = collect_listing_urls(search_url, max_pages=max_pages, pause=0.4)
+        urls_file.write_text("\n".join(listing_urls), encoding="utf-8")
+        print(f"Collected {len(listing_urls)} URLs and saved to {urls_file}")
+
+    # 2) open CSV (append mode), write header only if new
+    write_header = not out.exists()
+    with out.open("a", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f,
             fieldnames=["post_id", "url", "title", "price_dkk", "desc", "location", "date", "condition_text"],
-            quoting=csv.QUOTE_ALL,  # Quote all fields
-            quotechar='"',          # Use double quotes
-            escapechar='\\'         # Use backslash to escape quotes within fields
+            quoting=csv.QUOTE_ALL, quotechar='"', escapechar='\\'
         )
-        w.writeheader()
-        for u in urls:
+        if write_header:
+            w.writeheader()
+
+        # load seen post_ids to avoid duplicates
+        seen = set()
+        if not write_header:
+            import csv as _csv
+            with out.open("r", encoding="utf-8") as rf:
+                reader = _csv.DictReader(rf)
+                for row in reader:
+                    if row.get("post_id"):
+                        seen.add(row["post_id"])
+
+        # 3) iterate listings and parse
+        for idx, u in enumerate(listing_urls, start=1):
+            print(f"[{idx}/{len(listing_urls)}] Fetching {u}")
             try:
                 r = delayed_fetch(u)
             except Exception as e:
-                print(f"Fetch failed for {u}: {e}")
+                print("Fetch failed:", e)
                 continue
-            if r.ok:
-                item = parse_listing(r.text, u)
-                if not item:
-                    print(f"No item parsed for {u}")
-                    continue
+            if not r.ok:
+                print("HTTP error", r.status_code, "for", u)
+                continue
 
-                # If price parsed, write normally and log.
-                if item.get("price_dkk") is not None:
-                    w.writerow(item)
-                    f.flush()
-                    try:
-                        os.fsync(f.fileno())
-                    except Exception:
-                        pass
-                else:
-                    # Debug: also write a row with empty price so you can inspect failures
-                    debug_item = {**item, "price_dkk": ""}
-                    w.writerow(debug_item)
-                    f.flush()
-                    try:
-                        os.fsync(f.fileno())
-                    except Exception:
-                        pass
-                    print(f"WROTE debug row for {u} (missing price) — check the CSV to inspect HTML/fields")
-            else:
-                print(f"HTTP error {r.status_code} for {u}")
+            item = parse_listing(r.text, u)
+            pid = item.get("post_id")
+            if pid in seen:
+                print("SKIP already seen", pid)
+                continue
+
+            w.writerow(item)
+            f.flush()
+            try:
+                os.fsync(f.fileno())
+            except Exception:
+                pass
+            seen.add(pid)
+            print("WROTE", pid)
